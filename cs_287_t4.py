@@ -238,9 +238,24 @@ def test_model(model, test_iter, criterion, num_batches=-1):
             total_loss += loss.detach().item() * float(batch.premise.shape['batch'])
     return total_right / total, total_loss / total
 
-def checkpoint_trainer(model, optimizer, criterion, key, version, nepochs=20):
+def load_model(model, version=''):
     # model with lowest validation loss thus far is saved at path+'models'+key
     # we can also load a specific version, i.e. path+'models'+key+'E20B2000'
+    # not for training! Doesn't load an optimizer.
+    key = model.key
+    # load checkpoint
+    fname = path+'models'+key+version
+    if os.path.isfile(fname):
+        checkpoint = torch.load(fname)
+        epoch_start = checkpoint['epoch'] + 1
+        model.load_state_dict(checkpoint['model'])
+        best_val_loss = checkpoint['best_val_loss']
+        print("Loaded Checkpoint:", epoch_start, best_val_loss, np.exp(best_val_loss))
+
+def checkpoint_trainer(model, optimizer, criterion, version='', nepochs=20):
+    # model with lowest validation loss thus far is saved at path+'models'+key
+    # we can also load a specific version, i.e. path+'models'+key+'E20B2000'
+    key = model.key
     best_val_loss = -1
     epoch_start = 0
 
@@ -392,8 +407,9 @@ class DecomposableAttentionCore(ntorch.nn.Module):
         return yhat
 
 class DecomposableAttentionVanilla(ntorch.nn.Module):
-    def __init__(self, embedding_dim=embedding_dim, hidden_dim=200):
+    def __init__(self, key, embedding_dim=embedding_dim, hidden_dim=200):
         super(DecomposableAttentionVanilla, self).__init__()
+        self.key = key
         self.embedding = ntorch.nn.Embedding(len(TEXT.vocab), embedding_dim).spec('seqlen', 'representation')
         self.embedding.weight.data.copy_(TEXT.vocab.vectors.values)
         self.core = DecomposableAttentionCore(embedding_dim, hidden_dim)
@@ -412,17 +428,16 @@ class DecomposableAttentionVanilla(ntorch.nn.Module):
 
 """#### Training and Testing"""
 
-model = DecomposableAttentionVanilla().to(device)
+model = DecomposableAttentionVanilla('4.1.vanilla.prototype').to(device)
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 optimizer = torch.optim.Adagrad(model.parameters(), lr=0.05, lr_decay=0, weight_decay=0, initial_accumulator_value=0.1)
 criterion = ntorch.nn.CrossEntropyLoss().spec("output")
 
 # model with lowest validation loss thus far is saved at path+'models'+key
 # we can also load a specific version, i.e. path+'models'+key+'E20B2000'
-key = '4.1.vanilla.prototype'
 version = ''
 
-checkpoint_trainer(model, optimizer, criterion, key, version)
+checkpoint_trainer(model, optimizer, criterion, version)
 
 """#### Scratch"""
 
@@ -454,15 +469,30 @@ Distance biases $d_{i-j} \in \mathbb{R}$ are such that for $|i-j|>10$ the biases
 """
 
 class DecomposableAttentionIntra(ntorch.nn.Module):
-    def __init__(self, embedding_dim=embedding_dim, hidden_dim=200):
+    def __init__(self, key, embedding_dim=embedding_dim, hidden_dim=200, biasparamsperside=11):
         super(DecomposableAttentionIntra, self).__init__()
+        self.key = key
         self.embedding = ntorch.nn.Embedding(len(TEXT.vocab), embedding_dim).spec('seqlen', 'representation')
         self.embedding.weight.data.copy_(TEXT.vocab.vectors.values)
         self.Fintra = FeedForwardReLU('representation', embedding_dim, 'hidden', hidden_dim)
+        self.biasparamsperside = biasparamsperside
+        if self.biasparamsperside != -1:
+            # 3D vector to dance around ReplicationPad1d only working for 3D, 4D, 5D
+            self.biasparams = torch.nn.Parameter(torch.zeros(1, 1, 2 * biasparamsperside + 1), requires_grad=True)
         self.core = DecomposableAttentionCore(embedding_dim * 2, hidden_dim)
         # attention visualization
         self.aselfAttnWeights = None
         self.bselfAttnWeights = None
+    def distance_bias_matrix(self, seqlen):
+        npadding = max(0, seqlen - self.biasparamsperside - 1)
+        start = npadding + self.biasparamsperside
+        m = torch.nn.ReplicationPad1d(npadding)
+        padded = m(self.biasparams).squeeze()
+        row_list = []
+        for ii in range(seqlen):
+            row_list.append(torch.roll(padded, ii - start))
+        extended = torch.stack(row_list)
+        return extended[:, :seqlen]
     def forward(self, a, b):
         # a: batch, seqlen
         # b: batch, seqlen
@@ -475,9 +505,12 @@ class DecomposableAttentionIntra(ntorch.nn.Module):
         bdecomposedintra2 = bdecomposedintra.rename('hypothesisseqlen', 'hypothesisseqlen2') # batch, hypothesisseqlen2, hidden
         af = adecomposedintra.dot('hidden', adecomposedintra2) # batch, premiseseqlen, premiseseqlen2
         bf = bdecomposedintra.dot('hidden', bdecomposedintra2) # batch, hypothesisseqlen, hypothesisseqlen2
-        ## TODO: distance biases
-        self.aselfAttnWeights = af.softmax('premiseseqlen') # batch, premiseseqlen, premiseseqlen2
-        self.bselfAttnWeights = bf.softmax('hypothesisseqlen') # batch, hypothesisseqlen, hypothesisseqlen2
+        ad = bd = 0
+        if self.biasparamsperside != -1:
+            ad = NamedTensor(self.distance_bias_matrix(a.shape['seqlen']), ('premiseseqlen', 'premiseseqlen2')) # premiseseqlen, premiseseqlen2
+            bd = NamedTensor(self.distance_bias_matrix(b.shape['seqlen']), ('hypothesisseqlen', 'hypothesisseqlen2')) # hypothesisseqlen, hypothesisseqlen2
+        self.aselfAttnWeights = (af + ad).softmax('premiseseqlen') # batch, premiseseqlen, premiseseqlen2
+        self.bselfAttnWeights = (bf + bd).softmax('hypothesisseqlen') # batch, hypothesisseqlen, hypothesisseqlen2
         aprime = self.aselfAttnWeights.dot('premiseseqlen', aembedding) # batch, premiseseqlen2, embedding
         bprime = self.bselfAttnWeights.dot('hypothesisseqlen', bembedding) # batch, hypothesisseqlen2, embedding
         aprime = aprime.rename('premiseseqlen2', 'premiseseqlen') # batch, premiseseqlen, embedding
@@ -491,17 +524,21 @@ class DecomposableAttentionIntra(ntorch.nn.Module):
 
 """#### Training and Testing"""
 
-model = DecomposableAttentionIntra().to(device)
+# model = DecomposableAttentionIntra('4.2.intra.prototype', biasparamsperside=-1).to(device)
+model = DecomposableAttentionIntra('4.2.intra.distancebias').to(device)
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 optimizer = torch.optim.Adagrad(model.parameters(), lr=0.025, lr_decay=0, weight_decay=0, initial_accumulator_value=0.1)
 criterion = ntorch.nn.CrossEntropyLoss().spec("output")
 
 # model with lowest validation loss thus far is saved at path+'models'+key
 # we can also load a specific version, i.e. path+'models'+key+'E20B2000'
-key = '4.2.intra.prototype'
 version = ''
 
-checkpoint_trainer(model, optimizer, criterion, key, version)
+checkpoint_trainer(model, optimizer, criterion, version)
+
+"""#### Scratch"""
+
+model.biasparams
 
 """##  3. Visualize the attentions in the above two parts."""
 
@@ -553,6 +590,9 @@ def visualize(model, batch):
             ax.set_ylabel(ylabel)
 
             plt.show()
+
+model = DecomposableAttentionIntra('4.2.intra.distancebias').to(device)
+load_model(model)
 
 batch = next(iter(train_iter))
 visualize(model, batch)
