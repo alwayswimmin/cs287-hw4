@@ -235,7 +235,7 @@ def test_model(model, test_iter, criterion, num_batches=-1):
             loss += criterion(output, batch.label).values
             total += float(batch.premise.shape['batch'])
             total_right += preds_eq.sum().item()
-            total_loss += loss.detach().item()*float(batch.premise.shape['batch'])
+            total_loss += loss.detach().item() * float(batch.premise.shape['batch'])
     return total_right / total, total_loss / total
 
 def checkpoint_trainer(model, optimizer, criterion, key, version, nepochs=20):
@@ -259,6 +259,7 @@ def checkpoint_trainer(model, optimizer, criterion, key, version, nepochs=20):
                                             optimizer,
                                             criterion,
                                             every=1000,
+                                            key=key,
                                             epoch=epoch,
                                             best_val_loss=best_val_loss)
         val_acc, val_loss = test_model(model, val_iter, criterion)
@@ -394,6 +395,7 @@ class DecomposableAttentionVanilla(ntorch.nn.Module):
     def __init__(self, embedding_dim=embedding_dim, hidden_dim=200):
         super(DecomposableAttentionVanilla, self).__init__()
         self.embedding = ntorch.nn.Embedding(len(TEXT.vocab), embedding_dim).spec('seqlen', 'representation')
+        self.embedding.weight.data.copy_(TEXT.vocab.vectors.values)
         self.core = DecomposableAttentionCore(embedding_dim, hidden_dim)
         # attention visualization
         self.attnWeightsAlpha = None
@@ -453,8 +455,9 @@ Distance biases $d_{i-j} \in \mathbb{R}$ are such that for $|i-j|>10$ the biases
 
 class DecomposableAttentionIntra(ntorch.nn.Module):
     def __init__(self, embedding_dim=embedding_dim, hidden_dim=200):
-        super(DecomposableAttentionVanilla, self).__init__()
+        super(DecomposableAttentionIntra, self).__init__()
         self.embedding = ntorch.nn.Embedding(len(TEXT.vocab), embedding_dim).spec('seqlen', 'representation')
+        self.embedding.weight.data.copy_(TEXT.vocab.vectors.values)
         self.Fintra = FeedForwardReLU('representation', embedding_dim, 'hidden', hidden_dim)
         self.core = DecomposableAttentionCore(embedding_dim * 2, hidden_dim)
         # attention visualization
@@ -468,22 +471,22 @@ class DecomposableAttentionIntra(ntorch.nn.Module):
         adecomposedintra = self.Fintra(aembedding) # batch, premiseseqlen, hidden
         bdecomposedintra = self.Fintra(bembedding) # batch, hypothesisseqlen, hidden
         # the following renaming dance is necessary to distinguish between two otherwise equivalent dimensions in a square matrix.
-        adecomposedintra = adecomposedintra.rename('premiseseqlen', 'premiseseqlen2') # batch, premiseseqlen2, hidden
-        bdecomposedintra = bdecomposedintra.rename('hypothesisseqlen', 'hypothesisseqlen2') # batch, hypothesisseqlen2, hidden
-        af = adecomposedintra.dot('hidden', adecomposedintra) # batch, premiseseqlen, premiseseqlen2
-        bf = bdecomposedintra.dot('hidden', bdecomposedintra) # batch, hypothesisseqlen, hypothesisseqlen2
+        adecomposedintra2 = adecomposedintra.rename('premiseseqlen', 'premiseseqlen2') # batch, premiseseqlen2, hidden
+        bdecomposedintra2 = bdecomposedintra.rename('hypothesisseqlen', 'hypothesisseqlen2') # batch, hypothesisseqlen2, hidden
+        af = adecomposedintra.dot('hidden', adecomposedintra2) # batch, premiseseqlen, premiseseqlen2
+        bf = bdecomposedintra.dot('hidden', bdecomposedintra2) # batch, hypothesisseqlen, hypothesisseqlen2
         ## TODO: distance biases
-        self.aselfAttnWeights = af.softmax('premiseseqlen', af) # batch, premiseseqlen, premiseseqlen2
-        self.bselfAttnWeights = bf.softmax('hypothesisseqlen', bf) # batch, hypothesisseqlen, hypothesisseqlen2
+        self.aselfAttnWeights = af.softmax('premiseseqlen') # batch, premiseseqlen, premiseseqlen2
+        self.bselfAttnWeights = bf.softmax('hypothesisseqlen') # batch, hypothesisseqlen, hypothesisseqlen2
         aprime = self.aselfAttnWeights.dot('premiseseqlen', aembedding) # batch, premiseseqlen2, embedding
         bprime = self.bselfAttnWeights.dot('hypothesisseqlen', bembedding) # batch, hypothesisseqlen2, embedding
         aprime = aprime.rename('premiseseqlen2', 'premiseseqlen') # batch, premiseseqlen, embedding
-        bprime = aprime.rename('hypothesisseqlen2', 'premiseseqlen') # batch, hypothesisseqlen, embedding
-        abar = ntorch.cat((aembedding, af), 'representation') # batch, premiseseqlen, embedding * 2
-        bbar = ntorch.cat((bembedding, bf), 'representation') # batch, hypothesisseqlen, embedding * 2
+        bprime = bprime.rename('hypothesisseqlen2', 'hypothesisseqlen') # batch, hypothesisseqlen, embedding
+        abar = ntorch.cat((aembedding, aprime), 'representation') # batch, premiseseqlen, embedding * 2
+        bbar = ntorch.cat((bembedding, bprime), 'representation') # batch, hypothesisseqlen, embedding * 2
         yhat = self.core(abar, bbar) # batch, output
-        self.attnWeightsAlpha = core.attnWeightsAlpha
-        self.attnWeightsBeta = core.attnWeightsBeta
+        self.attnWeightsAlpha = self.core.attnWeightsAlpha
+        self.attnWeightsBeta = self.core.attnWeightsBeta
         return yhat
 
 """#### Training and Testing"""
