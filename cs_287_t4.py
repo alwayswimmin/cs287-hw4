@@ -188,8 +188,9 @@ path = "/content/drive/My Drive/College/current classes/CS 287 spring 2019/Homew
 embedding_dim = 300
 nclasses = len(LABEL.vocab)
 
-def train_model(model, train_iter, optimizer, criterion, every=1000, key='', epoch=0, best_val_loss=1E9):
+def train_model(model, train_iter, optimizer, criterion, every=1000, save=False, epoch=0, best_val_loss=1E9):
     model.train()
+    key = model.key
     total_loss=0.
     num_batches=0.
     total=0.
@@ -210,7 +211,7 @@ def train_model(model, train_iter, optimizer, criterion, every=1000, key='', epo
         torch.cuda.empty_cache() 
         if(b%every == 0):
             print('[B{:4d}] Train Loss: {:.3e}'.format(b, total_loss/total))
-            if key != '':
+            if save:
                 torch.save({
                 'epoch': epoch,
                 'model': model.state_dict(),
