@@ -1,0 +1,4 @@
+torch
+torchtext
+opt_einsum
+git+https://github.com/harvardnlp/namedtensor
