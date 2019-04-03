@@ -161,7 +161,8 @@ def test_code(model):
         # Your prediction data here (don't cheat!)
         probs = model(batch.premise, batch.hypothesis)
         # here we assume that the name for dimension classes is `classes`
-        _, argmax = probs.max('classes')
+        # _, argmax = probs.max('classes')
+        _, argmax = probs.max('output')
         upload += argmax.tolist()
 
     with open("predictions.txt", "w") as f:
@@ -178,6 +179,8 @@ import os.path
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+from namedtensor.distributions import ndistributions
 
 from google.colab import drive
 drive.mount('/content/drive')
@@ -275,7 +278,6 @@ def checkpoint_trainer(model, optimizer, criterion, version='', nepochs=20):
                                             optimizer,
                                             criterion,
                                             every=1000,
-                                            key=key,
                                             epoch=epoch,
                                             best_val_loss=best_val_loss)
         val_acc, val_loss = test_model(model, val_iter, criterion)
@@ -440,6 +442,15 @@ version = ''
 
 checkpoint_trainer(model, optimizer, criterion, version)
 
+model = DecomposableAttentionVanilla('4.1.vanilla.v1').to(device)
+load_model(model)
+criterion = ntorch.nn.CrossEntropyLoss().spec("output")
+test_model(model, test_iter, criterion)
+
+test_code(model)
+from google.colab import files
+files.download('predictions.txt')
+
 """#### Scratch"""
 
 # val_acc, val_loss = test_model(model, val_iter, criterion)
@@ -537,6 +548,11 @@ version = ''
 
 checkpoint_trainer(model, optimizer, criterion, version)
 
+model = DecomposableAttentionIntra('4.1.intra.v1').to(device)
+load_model(model)
+criterion = ntorch.nn.CrossEntropyLoss().spec("output")
+test_model(model, test_iter, criterion)
+
 """#### Scratch"""
 
 model.biasparams
@@ -592,19 +608,263 @@ def visualize(model, batch):
 
             plt.show()
 
-model = DecomposableAttentionIntra('4.2.intra.distancebias').to(device)
+model = DecomposableAttentionVanilla('4.1.vanilla.v1').to(device)
+# model = DecomposableAttentionIntra('4.2.intra.v1').to(device)
 load_model(model)
 
 batch = next(iter(train_iter))
 visualize(model, batch)
 
-"""## 4. Implement a mixture of models with uniform prior and perform training with exact log marginal likelihood (see below for detailed instructions)"""
+model = DecomposableAttentionIntra('4.2.intra.v1').to(device)
+load_model(model)
+
+batch = next(iter(train_iter))
+visualize(model, batch)adskjlfasdfkljsadfajdfs;
+
+"""## 4. Implement a mixture of models with uniform prior and perform training with exact log marginal likelihood (see below for detailed instructions)
+
+### Instructions for latent variable mixture model.
+
+For the last part of this assignment we will consider a latent variable version of this model. This is a use of latent variable as a form of ensembling.
+
+Instead of a single model, we use $K$ models $p(y | \mathbf{a}, \mathbf{b}; \theta_k)$ ($k=1,\cdots,K$), where $K$ is a hyperparameter. Let's introduce a discrete latent variable $c\sim \text{Uniform}(1,\cdots, K)$ denoting which model is being used to produce the label $y$, then the marginal likelihood is
 
 
+$$
+p(y|\mathbf{a}, \mathbf{b}; \theta) = \sum_{c=1}^K p(c) p(y | \mathbf{a}, \mathbf{b}; \theta_c)
+$$
 
-"""## 5. Train the mixture of models in part 4 with VAE. (This may not produce a better model, this is still a research area)"""
+When $K$ is small, we can *enumerate* all possible values of $c$ to maximize the log marginal likelihood.
+
+### Code
+
+#### Class Definitions
+"""
+
+class MixtureModel(ntorch.nn.Module):
+    def __init__(self, key, K):
+        super(MixtureModel, self).__init__()
+        self.key = key
+        self.K = K
+        self.models = torch.nn.ModuleList([DecomposableAttentionIntra(key+str(k)) for k in range(K)])
+        
+    def forward(self, a, b):
+        yhats = [self.models[k](a,b) for k in range(self.K)]
+        avg_yhat = self.models[0](a,b)
+        for k in range(1,self.K):
+            avg_yhat += self.models[k](a,b)
+        avg_yhat /= self.K
+        return avg_yhat
+
+"""#### Training and Testing"""
+
+model = MixtureModel('4.4.mixture', 3).to(device)
+# optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adagrad(model.parameters(), lr=0.05, lr_decay=0, weight_decay=0, initial_accumulator_value=0.1)
+criterion = ntorch.nn.CrossEntropyLoss().spec("output")
+
+# model with lowest validation loss thus far is saved at path+'models'+key
+# we can also load a specific version, i.e. path+'models'+key+'E20B2000'
+version = ''
+
+checkpoint_trainer(model, optimizer, criterion, version)
+
+"""## 5. Train the mixture of models in part 4 with VAE. (This may not produce a better model, this is still a research area)
+
+### Instructions for VAE
+
+We can also use variational auto encoding to perform efficient training. We first introduce an inference network $q(c| y, \mathbf{a}, \mathbf{b})$, and the ELBO is
+
+$$
+\log p(y|\mathbf{a}, \mathbf{b}; \theta)  \ge \mathbb{E}_{c \sim q(c|y, \mathbf{a}, \mathbf{b})} \log p(y|\mathbf{a},\mathbf{b}; \theta_c) - KL(q(c|y, \mathbf{a}, \mathbf{b})|| p(c)),
+$$
+
+where $p(c)$ is the prior uniform distribution. We can calculate the $KL$ term in closed form, but for the first term in ELBO, due to the discreteness of $c$, we cannot use the reparameterization trick. Instead we use REINFORCE to estimate the gradients (or see slides):
+
+$$
+\nabla \mathbb{E}_{c \sim q(c|y, \mathbf{a}, \mathbf{b})} \log p(y|\mathbf{a},\mathbf{b}; \theta_c) = \mathbb{E}_{c \sim q(c|y, \mathbf{a}, \mathbf{b})} \left [\nabla \log p(y|\mathbf{a},\mathbf{b}; \theta_c) + \log p(y|\mathbf{a},\mathbf{b}; \theta_c)  \nabla \log q(c|y, \mathbf{a}, \mathbf{b})\right]
+$$
 
 
+At inference time, to get $p(y|\mathbf{a}, \mathbf{b}; \theta)$ we use enumeration to calculate it exactly. For posterior inference, we can either use $q(c| y, \mathbf{a}, \mathbf{b})$ to approximate the true posterior or use Bayes rule to calculate the posterior exactly.
+
+### Code
+"""
+
+class QInference(ntorch.nn.Module):
+    def __init__(self, K, representation_dim=embedding_dim, hidden_dim=200):
+        super(QInference, self).__init__()
+        self.K = K
+        self.embedding = ntorch.nn.Embedding(len(TEXT.vocab), embedding_dim).spec('seqlen', 'representation')
+        self.embedding.weight.data.copy_(TEXT.vocab.vectors.values)
+        self.F = FeedForwardReLU('representation', representation_dim, 'attention', hidden_dim)
+        self.G = FeedForwardReLU('representation', representation_dim * 2, 'comparison', hidden_dim)
+        self.H1 = FeedForwardReLU('comparison', hidden_dim * 2 + hidden_dim, 'hidden', hidden_dim)
+        self.H2 = ntorch.nn.Linear(hidden_dim, K).spec('hidden', 'output')
+        # attention visualization
+        self.attnWeightsAlpha = None
+        self.attnWeightsBeta = None
+        self.yembedding = ntorch.nn.Embedding(len(LABEL.vocab), hidden_dim).spec('batch', 'comparison')
+    def forward(self, a, b, y):
+        # abar: batch, premiseseqlen, representation
+        # bbar: batch, premiseseqlen, representation
+        abar = self.embedding(a).rename('seqlen', 'premiseseqlen') # batch, premiseseqlen, embedding
+        bbar = self.embedding(b).rename('seqlen', 'hypothesisseqlen') # batch, hypothesisseqlen, embedding
+        adecomposed = self.F(abar) # batch, premiseseqlen, attention
+        bdecomposed = self.F(bbar) # batch, hypothesisseqlen, attention
+        e = adecomposed.dot('attention', bdecomposed) # batch, premiseseqlen, hypothesisseqlen
+        self.attnWeightsAlpha = e.softmax('premiseseqlen') # batch, premiseseqlen, hypothesisseqlen
+        self.attnWeightsBeta = e.softmax('hypothesisseqlen') # batch, premiseseqlen, hypothesisseqlen
+        alpha = self.attnWeightsAlpha.dot('premiseseqlen', abar) # batch, hypothesisseqlen, representation
+        beta = self.attnWeightsBeta.dot('hypothesisseqlen', bbar) # batch, premisesseqlen, representation
+        aBeta = ntorch.cat((abar, beta), 'representation') # batch, premisesseqlen, representation * 2
+        bAlpha = ntorch.cat((bbar, alpha), 'representation') # batch, hypothesisseqlen, representation * 2
+        v1dot = self.G(aBeta) # batch, premiseseqlen, comparison
+        v2dot = self.G(bAlpha) # batch, hypothesisseqlen, comparison
+        v1 = v1dot.sum('premiseseqlen') # batch, comparison
+        v2 = v2dot.sum('hypothesisseqlen') # batch, comparison
+        y_emb = self.yembedding(y)
+        v = ntorch.cat((v1, v2, y_emb), 'comparison') # batch, comparison * 2
+        yhat = self.H2(self.H1(v)) # batch, output
+        return yhat
+
+class VAE(ntorch.nn.Module):
+    def __init__(self, key, K):
+        super(VAE, self).__init__()
+        self.key = key
+        self.K = K
+        self.models = torch.nn.ModuleList([DecomposableAttentionIntra(key+str(k)) for k in range(K)])
+        
+    def forward(self, c, a, b):
+        l = [(c.get('batch', i).item(), a.get('batch', i), b.get('batch', i)) for i in range(c.shape('batch'))]
+        y_hat = ntorch.stack([self.models[ci](ai, bi) for ci, ai, bi in l], 'batch')
+        return y_hat
+
+"""#### Modified Training Code"""
+
+def train_model_vae(q_inference, model, train_iter, optimizer, criterion, every=1000, save=False, epoch=0, best_val_loss=1E9):
+    q_inference.train()
+    model.train()
+    key = model.key
+    total_loss=0.
+    num_batches=0.
+    total=0.
+    total_right=0.
+    for b, batch in enumerate(train_iter):
+        optimizer.zero_grad()
+        premise, hypothesis, label = batch.premise, batch.hypothesis, batch.label
+        probs = q_inference(premise, hypothesis, label)
+        var_posterior = ndistributions.Categorical(probs)
+        print(probs.shape)
+        print(var_posterior)
+        c = var_posterior.sample() # no gradients can be backpropagated further here!
+        c_probs = c * probs + (1-c) * (1-probs) # ?
+
+        output = model(c, premise, hypothesis)
+        batch_size = output.size('batch')
+
+        nll_raw = criterion(output, label)
+        nll = nll_raw.sum()
+        prior = ndistributions.Categorical(
+            NamedTensor(torch.zeros_like(c.transpose('batch', 'c').values).fill_(1.0 / q_inference.K).to(device), ('batch', 'c'))
+        )
+        kl = ndistributions.kl_divergence(var_posterior, prior).sum()
+
+        l = nll.item()
+        k = kl.item()
+        kl_weight = 1.0 # min(1.0, (float(i)/kl_anneal_steps)**2)
+        reinforce_term = (nll_raw.detach() * c_probs.log()).sum()
+
+        total_loss = nll.values + kl * kl_weight + reinforce_term.values
+        total_loss = total_loss / batch_size
+        total_loss.backward()
+        optimizer.step()
+        
+        preds = output.max('output')[1]
+        preds_eq = preds.eq(batch.label)
+        
+        num_batches += 1
+        total += float(batch.premise.shape['batch'])
+        total_right += preds_eq.sum().item()
+        total_loss += loss.detach().item()*float(batch.premise.shape['batch'])
+        torch.cuda.empty_cache() 
+        if(b%every == 0):
+            print('[B{:4d}] Train Loss: {:.3e}'.format(b, total_loss/total))
+            if save:
+                torch.save({
+                'epoch': epoch,
+                'q_inference': q_inference,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'best_val_loss': best_val_loss
+                }, path+'models'+key+'E{:4d}B{:4d}'.format(epoch, b))
+    return total_right / total, total_loss / total
+
+def test_model_vae(q_inference, model, test_iter, criterion, num_batches=-1):
+    pass
+    model.eval()
+    with torch.no_grad():
+        total = 0
+        total_right = 0
+        total_loss = 0
+        for b, batch in enumerate(test_iter):
+            if(not(num_batches==-1) and b > num_batches):
+                break
+            output = model(batch.premise, batch.hypothesis)
+            preds = output.max('output')[1]
+            preds_eq = preds.eq(batch.label)
+            loss = 0.
+            loss += criterion(output, batch.label).values
+            total += float(batch.premise.shape['batch'])
+            total_right += preds_eq.sum().item()
+            total_loss += loss.detach().item() * float(batch.premise.shape['batch'])
+    return total_right / total, total_loss / total
+
+def checkpoint_trainer_vae(q_inference, model, optimizer, criterion, version='', nepochs=20):
+    # model with lowest validation loss thus far is saved at path+'models'+key
+    # we can also load a specific version, i.e. path+'models'+key+'E20B2000'
+    key = model.key
+    best_val_loss = -1
+    epoch_start = 0
+
+    # load checkpoint
+    fname = path+'models'+key+version
+    if os.path.isfile(fname):
+        checkpoint = torch.load(fname)
+        epoch_start = checkpoint['epoch'] + 1
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        best_val_loss = checkpoint['best_val_loss']
+        print("Loaded Checkpoint:", epoch_start, best_val_loss, np.exp(best_val_loss))
+
+    for epoch in range(epoch_start, nepochs):
+        train_acc, train_loss = train_model_vae(q_inference, model, train_iter, 
+                                                optimizer,
+                                                criterion,
+                                                every=1000,
+                                                epoch=epoch,
+                                                best_val_loss=best_val_loss)
+        val_acc, val_loss = test_model(model, val_iter, criterion)
+        print('[E{:4d}] | Train Acc: {:.3e} Train Loss: {:.3e} | Val Acc: {:.3e} Val Loss: {:.3e} PPL: {:.3e}'.format(epoch, train_acc, train_loss, val_acc, val_loss, np.exp(val_loss)))
+        if(val_loss < best_val_loss or best_val_loss == -1):
+            best_val_loss = val_loss
+            torch.save({
+                'epoch': epoch,
+                'q_inference': q_inference,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                }, path+'models'+key)
+
+"""#### Scratch"""
+
+K = 3
+q_inference = QInference(K).to(device)
+model = VAE('4.5.vae.prototype', K).to(device)
+optimizer = torch.optim.Adagrad(model.parameters(), lr=0.05, lr_decay=0, weight_decay=0, initial_accumulator_value=0.1)
+criterion = ntorch.nn.CrossEntropyLoss().spec("output")
+
+checkpoint_trainer_vae(q_inference, model, optimizer, criterion)
 
 """## 6. Interpret which component specializes at which type of tasks using the posterior."""
 
