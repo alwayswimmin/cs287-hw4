@@ -74,7 +74,10 @@ print('LABEL.vocab', LABEL.vocab)
 """Finally we are ready to create batches of our training data that can be used for training and validating the model. This function produces 3 iterators that will let us go through the train, val and test data."""
 
 train_iter, val_iter, test_iter = torchtext.data.BucketIterator.splits(
-    (train, val, test), batch_size=16, device=torch.device("cuda"), repeat=False)
+    (train, val, test), batch_size=16, device=torch.device("cpu"), repeat=False)
+
+# train_iter, val_iter, test_iter = torchtext.data.BucketIterator.splits(
+#     (train, val, test), batch_size=16, device=torch.device("cuda"), repeat=False)
 
 """Let's look at a single batch from one of these iterators."""
 
@@ -726,7 +729,7 @@ class QInference(ntorch.nn.Module):
         y_emb = self.yembedding(y)
         v = ntorch.cat((v1, v2, y_emb), 'comparison') # batch, comparison * 2
         yhat = self.H2(self.H1(v)) # batch, output
-        return yhat
+        return yhat.softmax('output')
 
 class VAE(ntorch.nn.Module):
     def __init__(self, key, K):
@@ -736,7 +739,7 @@ class VAE(ntorch.nn.Module):
         self.models = torch.nn.ModuleList([DecomposableAttentionIntra(key+str(k)) for k in range(K)])
         
     def forward(self, c, a, b):
-        l = [(c.get('batch', i).item(), a.get('batch', i), b.get('batch', i)) for i in range(c.shape('batch'))]
+        l = [(c.get('batch', i).item(), a.get('batch', i), b.get('batch', i)) for i in range(c.shape['batch'])]
         y_hat = ntorch.stack([self.models[ci](ai, bi) for ci, ai, bi in l], 'batch')
         return y_hat
 
@@ -754,30 +757,28 @@ def train_model_vae(q_inference, model, train_iter, optimizer, criterion, every=
         optimizer.zero_grad()
         premise, hypothesis, label = batch.premise, batch.hypothesis, batch.label
         probs = q_inference(premise, hypothesis, label)
-        var_posterior = ndistributions.Categorical(probs)
-        print(probs.shape)
-        print(var_posterior)
+        var_posterior = ndistributions.Categorical(logits=probs.log(), dim_logit='output')
         c = var_posterior.sample() # no gradients can be backpropagated further here!
-        c_probs = c * probs + (1-c) * (1-probs) # ?
-
+        # c_probs = probs.index_select('output', c) # z * probs + (1-z) * (1-probs) # ?
+        c_probs = ntorch.stack([probs[{'batch':i, 'output':c[{'batch':i}].item()}] for i in range(c.shape['batch'])],'batch')
+        
         output = model(c, premise, hypothesis)
         batch_size = output.size('batch')
 
         nll_raw = criterion(output, label)
         nll = nll_raw.sum()
         prior = ndistributions.Categorical(
-            NamedTensor(torch.zeros_like(c.transpose('batch', 'c').values).fill_(1.0 / q_inference.K).to(device), ('batch', 'c'))
+            NamedTensor(torch.ones(batch_size, K) / K, ('batch', 'output'))
         )
         kl = ndistributions.kl_divergence(var_posterior, prior).sum()
 
         l = nll.item()
         k = kl.item()
         kl_weight = 1.0 # min(1.0, (float(i)/kl_anneal_steps)**2)
-        reinforce_term = (nll_raw.detach() * c_probs.log()).sum()
+        reinforce_term = (nll_raw.detach().item() * c_probs.log()).sum()
 
-        total_loss = nll.values + kl * kl_weight + reinforce_term.values
-        total_loss = total_loss / batch_size
-        total_loss.backward()
+        loss = nll.values + kl * kl_weight + reinforce_term.values
+        loss.backward()
         optimizer.step()
         
         preds = output.max('output')[1]
@@ -787,7 +788,7 @@ def train_model_vae(q_inference, model, train_iter, optimizer, criterion, every=
         total += float(batch.premise.shape['batch'])
         total_right += preds_eq.sum().item()
         total_loss += loss.detach().item()*float(batch.premise.shape['batch'])
-        torch.cuda.empty_cache() 
+        # torch.cuda.empty_cache() 
         if(b%every == 0):
             print('[B{:4d}] Train Loss: {:.3e}'.format(b, total_loss/total))
             if save:
@@ -859,8 +860,8 @@ def checkpoint_trainer_vae(q_inference, model, optimizer, criterion, version='',
 """#### Scratch"""
 
 K = 3
-q_inference = QInference(K).to(device)
-model = VAE('4.5.vae.prototype', K).to(device)
+q_inference = QInference(K) # .to(device)
+model = VAE('4.5.vae.prototype', K) # .to(device)
 optimizer = torch.optim.Adagrad(model.parameters(), lr=0.05, lr_decay=0, weight_decay=0, initial_accumulator_value=0.1)
 criterion = ntorch.nn.CrossEntropyLoss().spec("output")
 
