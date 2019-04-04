@@ -247,6 +247,10 @@ class DecomposableAttentionIntra(ntorch.nn.Module):
         # attention visualization
         self.aselfAttnWeights = None
         self.bselfAttnWeights = None
+        self.init_weights()
+    def init_weights(self):
+        for parameter in self.parameters():
+            parameter.data.uniform_(-0.05, 0.05)
     def distance_bias_matrix(self, seqlen):
         npadding = max(0, seqlen - self.biasparamsperside - 1)
         start = npadding + self.biasparamsperside
@@ -287,13 +291,13 @@ class DecomposableAttentionIntra(ntorch.nn.Module):
         return yhat
 
 # model = DecomposableAttentionIntra('4.2.intra.prototype', biasparamsperside=-1).to(device)
-model = DecomposableAttentionIntra('4.2.intra.v1').to(device)
+model = DecomposableAttentionIntra('4.2.intra.v3', hidden_dim=150).to(device)
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-optimizer = torch.optim.Adagrad(model.parameters(), lr=0.025, lr_decay=0, weight_decay=0, initial_accumulator_value=0.1)
+optimizer = torch.optim.Adagrad(model.parameters(), lr=0.03, lr_decay=0, weight_decay=0, initial_accumulator_value=0.1)
 criterion = ntorch.nn.CrossEntropyLoss().spec("output")
 
 # model with lowest validation loss thus far is saved at path+'models'+key
 # we can also load a specific version, i.e. path+'models'+key+'E20B2000'
 version = ''
 
-checkpoint_trainer(model, optimizer, criterion, version, epoch_size_modifier=6)
+checkpoint_trainer(model, optimizer, criterion, version)

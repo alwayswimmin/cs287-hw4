@@ -6,6 +6,7 @@ from torchtext.vocab import Vectors, GloVe
 # Named Tensor wrappers
 from namedtensor import ntorch, NamedTensor
 from namedtensor.text import NamedField
+
 # Our input $x$
 TEXT = NamedField(names=('seqlen',))
 
@@ -44,7 +45,8 @@ def test_code(model):
         # Your prediction data here (don't cheat!)
         probs = model(batch.premise, batch.hypothesis)
         # here we assume that the name for dimension classes is `classes`
-        _, argmax = probs.max('classes')
+        # _, argmax = probs.max('classes')
+        _, argmax = probs.max('output')
         upload += argmax.tolist()
 
     with open("predictions.txt", "w") as f:
@@ -57,13 +59,15 @@ import os.path
 import matplotlib.pyplot as plt
 import numpy as np
 
-device = torch.device("cuda:0")
+from namedtensor.distributions import ndistributions
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 path = "data/"
 
 embedding_dim = 300
 nclasses = len(LABEL.vocab)
 
-def train_model(model, train_iter, optimizer, criterion, every=1000, save=False, epoch=0, best_val_loss=1E9, epoch_size_modifier=1):
+def train_model(model, train_iter, optimizer, criterion, every=1000, save=False, epoch=0, best_val_loss=1E9):
     model.train()
     key = model.key
     total_loss=0.
@@ -71,8 +75,6 @@ def train_model(model, train_iter, optimizer, criterion, every=1000, save=False,
     total=0.
     total_right=0.
     for b, batch in enumerate(train_iter):
-        if b % epoch_size_modifier != epoch % epoch_size_modifier:
-            continue
         optimizer.zero_grad()
         output = model(batch.premise, batch.hypothesis)
         preds = output.max('output')[1]
@@ -86,7 +88,7 @@ def train_model(model, train_iter, optimizer, criterion, every=1000, save=False,
         total_right += preds_eq.sum().item()
         total_loss += loss.detach().item()*float(batch.premise.shape['batch'])
         torch.cuda.empty_cache() 
-        if(b % every == 0):
+        if(b%every == 0):
             print('[B{:4d}] Train Loss: {:.3e}'.format(b, total_loss/total))
             if save:
                 torch.save({
@@ -130,7 +132,7 @@ def load_model(model, version=''):
         best_val_loss = checkpoint['best_val_loss']
         print("Loaded Checkpoint:", epoch_start, best_val_loss, np.exp(best_val_loss))
 
-def checkpoint_trainer(model, optimizer, criterion, version='', nepochs=20, epoch_size_modifier=1):
+def checkpoint_trainer(model, optimizer, criterion, version='', nepochs=20):
     # model with lowest validation loss thus far is saved at path+'models'+key
     # we can also load a specific version, i.e. path+'models'+key+'E20B2000'
     key = model.key
@@ -153,8 +155,7 @@ def checkpoint_trainer(model, optimizer, criterion, version='', nepochs=20, epoc
                                             criterion,
                                             every=1000,
                                             epoch=epoch,
-                                            best_val_loss=best_val_loss,
-                                            epoch_size_modifier=epoch_size_modifier)
+                                            best_val_loss=best_val_loss)
         val_acc, val_loss = test_model(model, val_iter, criterion)
         print('[E{:4d}] | Train Acc: {:.3e} Train Loss: {:.3e} | Val Acc: {:.3e} Val Loss: {:.3e} PPL: {:.3e}'.format(epoch, train_acc, train_loss, val_acc, val_loss, np.exp(val_loss)))
         if(val_loss < best_val_loss or best_val_loss == -1):
@@ -286,14 +287,80 @@ class DecomposableAttentionIntra(ntorch.nn.Module):
         self.attnWeightsBeta = self.core.attnWeightsBeta
         return yhat
 
-# model = DecomposableAttentionIntra('4.2.intra.prototype', biasparamsperside=-1).to(device)
-model = DecomposableAttentionIntra('4.2.intra.v1').to(device)
+def visualize(model, batch):
+    model.eval()
+    # a: batch, seqlen
+    # b: batch, seqlen
+    intra = isinstance(model, DecomposableAttentionIntra)
+    yhat = model(batch.premise, batch.hypothesis)
+    for batchnum in range(batch.premise.shape['batch']):
+        premise = batch.premise.get("batch", batchnum)
+        hypothesis = batch.hypothesis.get("batch", batchnum)
+        label = batch.label.get("batch", batchnum)
+        attnWeightsAlpha = model.attnWeightsAlpha.get("batch", batchnum) # premiseseqlen, hypothesisseqlen
+        attnWeightsBeta = model.attnWeightsBeta.get("batch", batchnum) # premiseseqlen, hypothesisseqlen
+        if intra:
+            aselfAttnWeights = model.aselfAttnWeights.get("batch", batchnum) # premiseseqlen, premiseseqlen
+            bselfAttnWeights = model.bselfAttnWeights.get("batch", batchnum) # hypothesisseqlen, hypothesisseqlen
+        
+        premise = [TEXT.vocab.itos[i] for i in premise.tolist()]
+        hypothesis = [TEXT.vocab.itos[i] for i in hypothesis.tolist()]
+        label = LABEL.vocab.itos[label.item()]
+        
+        # title, ylabel, ytickslabels, xlabel, xticklabels, data
+        graph_info = []
+        graph_info.append(('$\\alpha$ Attention', 'premise', premise, 'hypothesis', hypothesis, attnWeightsAlpha.cpu().detach().numpy()))
+        graph_info.append(('$\\beta$ Attention', 'premise', premise, 'hypothesis', hypothesis, attnWeightsBeta.cpu().detach().numpy()))
+        if intra:
+            graph_info.append(('$a$ Self-Attention', 'premise', premise, 'premise', premise, aselfAttnWeights.cpu().detach().numpy()))
+            graph_info.append(('$b$ Self-Attention', 'hypothesis', hypothesis, 'hypothesis', hypothesis, bselfAttnWeights.cpu().detach().numpy()))
+        
+        for title, ylabel, row_labels, xlabel, column_labels, data in graph_info:
+            fig, ax = plt.subplots()
+            heatmap = ax.pcolor(data, cmap=plt.cm.Blues)
+
+            # put the major ticks at the middle of each cell
+            ax.set_xticks(np.arange(data.shape[1]) + 0.5)
+            ax.set_yticks(np.arange(data.shape[0]) + 0.5)
+
+            # want a more natural, table-like display
+            ax.invert_yaxis()
+            ax.xaxis.tick_top()
+            plt.xticks(rotation=60)
+
+            ax.set_title(title)
+            ax.set_xticklabels(column_labels)
+            ax.set_xlabel(xlabel)
+            ax.set_yticklabels(row_labels)
+            ax.set_ylabel(ylabel)
+
+            plt.show()
+
+class MixtureModel(ntorch.nn.Module):
+    def __init__(self, key, K):
+        super(MixtureModel, self).__init__()
+        self.key = key
+        self.K = K
+        self.models = torch.nn.ModuleList([DecomposableAttentionIntra(key+str(k)) for k in range(K)])
+        
+    def forward(self, a, b):
+        yhats = [self.models[k](a,b) for k in range(self.K)]
+        avg_yhat = self.models[0](a,b)
+        for k in range(1,self.K):
+            avg_yhat += self.models[k](a,b)
+        avg_yhat /= self.K
+        return avg_yhat
+
+model = MixtureModel('4.4.mixture.v1', 3).to(device)
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 optimizer = torch.optim.Adagrad(model.parameters(), lr=0.025, lr_decay=0, weight_decay=0, initial_accumulator_value=0.1)
-criterion = ntorch.nn.CrossEntropyLoss().spec("output")
+criterion = ntorch.nn.CrossEntropyLoss(reduction='sum').spec("output")
 
 # model with lowest validation loss thus far is saved at path+'models'+key
 # we can also load a specific version, i.e. path+'models'+key+'E20B2000'
 version = ''
 
-checkpoint_trainer(model, optimizer, criterion, version, epoch_size_modifier=6)
+load_model(model, version)
+acc, loss = test_model(model, test_iter, criterion)
+print('Acc: {:.3e} Loss: {:.3e}'.format(acc, loss))
+test_code(model)

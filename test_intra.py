@@ -44,7 +44,8 @@ def test_code(model):
         # Your prediction data here (don't cheat!)
         probs = model(batch.premise, batch.hypothesis)
         # here we assume that the name for dimension classes is `classes`
-        _, argmax = probs.max('classes')
+        # _, argmax = probs.max('classes')
+        _, argmax = probs.max('output')
         upload += argmax.tolist()
 
     with open("predictions.txt", "w") as f:
@@ -290,10 +291,13 @@ class DecomposableAttentionIntra(ntorch.nn.Module):
 model = DecomposableAttentionIntra('4.2.intra.v1').to(device)
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 optimizer = torch.optim.Adagrad(model.parameters(), lr=0.025, lr_decay=0, weight_decay=0, initial_accumulator_value=0.1)
-criterion = ntorch.nn.CrossEntropyLoss().spec("output")
+criterion = ntorch.nn.CrossEntropyLoss(reduction='sum').spec("output")
 
 # model with lowest validation loss thus far is saved at path+'models'+key
 # we can also load a specific version, i.e. path+'models'+key+'E20B2000'
 version = ''
 
-checkpoint_trainer(model, optimizer, criterion, version, epoch_size_modifier=6)
+load_model(model, version)
+acc, loss = test_model(model, test_iter, criterion)
+print('Acc: {:.3e} Loss: {:.3e}'.format(acc, loss))
+test_code(model)
